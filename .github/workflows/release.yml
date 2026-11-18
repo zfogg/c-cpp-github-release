@@ -1,0 +1,98 @@
+name: Reusable C/C++ release
+
+on:
+  workflow_call:
+    inputs:
+      build_script:
+        description: Repository-relative script that builds and writes ZIPs to the output directory
+        required: true
+        type: string
+      release_tag:
+        description: Release tag; defaults to the pushed tag
+        required: false
+        type: string
+      publish:
+        description: Publish the collected ZIPs as a GitHub release
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: release-${{ github.repository }}-${{ inputs.release_tag || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, arch: x86_64, runner: ubuntu-24.04 }
+          - { os: linux, arch: arm64, runner: ubuntu-24.04-arm }
+          - { os: macos, arch: x86_64, runner: macos-15-intel }
+          - { os: macos, arch: arm64, runner: macos-15 }
+          - { os: windows, arch: x86_64, runner: windows-2022 }
+          - { os: windows, arch: arm64, runner: windows-11-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Set up MSVC
+        if: matrix.os == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch == 'arm64' && 'arm64' || 'x64' }}
+      - name: Install repository dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ '${{ matrix.os }}' = windows ]; then
+            if [ -f scripts/install-deps.ps1 ]; then pwsh -File scripts/install-deps.ps1; fi
+          elif [ -f scripts/install-deps.sh ]; then
+            bash scripts/install-deps.sh '${{ matrix.os }}'
+          fi
+      - name: Build, test, verify, and package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          bash '${{ inputs.build_script }}' \
+            --os '${{ matrix.os }}' \
+            --arch '${{ matrix.arch }}' \
+            --output "$PWD/dist"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    if: inputs.publish
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Verify archive set and create checksums
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          set -euxo pipefail
+          test "$(find dist -name '*.zip' | wc -l)" -eq 6
+          (cd dist && sha256sum *.zip > SHA256SUMS)
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS
